@@ -1,0 +1,20 @@
+[project]
+name = "self-learn-tech"
+version = "0.1.0"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+ "fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1", "python-multipart>=0.0.20",
+ "pydantic-settings>=2.8,<3", "langchain-text-splitters>=1,<2", "langchain>=1.0,<2", "langchain-openai>=1.0,<2",
+ "langgraph>=1.0,<2", "deepagents>=0.4,<1", "langsmith>=0.3,<1",
+ "aiokafka>=0.12,<1", "pymupdf>=1.25,<2", "python-pptx>=1.0,<2", "pillow>=11,<13"
+]
+[project.optional-dependencies]
+test = ["pytest>=8", "httpx>=0.28", "pytest-asyncio>=0.25"]
+eval = ["ragas==0.4.3", "langchain-community==0.4.1"]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+[tool.setuptools]
+packages = ["app"]

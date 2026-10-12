@@ -1,0 +1,48 @@
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    ports: ["127.0.0.1:9092:9092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:29093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes: ["kafka-data:/var/lib/kafka/data"]
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      KAFKA_BOOTSTRAP: kafka:29092
+    volumes: ["app-data:/data"]
+    ports: ["127.0.0.1:8000:8000"]
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      KAFKA_BOOTSTRAP: kafka:29092
+    volumes: ["app-data:/data"]
+    depends_on: [kafka]
+    restart: unless-stopped
+  frontend:
+    build: ./frontend
+    ports: ["127.0.0.1:5173:80"]
+    depends_on: [api]
+volumes:
+  app-data:
+  kafka-data:

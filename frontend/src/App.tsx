@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { BookOpen, Plus, ArrowUp, FileText, Upload, MessageSquare, Sparkles, Presentation, Mic, X, ArrowLeft, Download, Check, LoaderCircle, LogOut, Leaf } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
-import { request, stream, type Source } from './api';
+import { request, stream, ApiError, isGatewayError, waitForRetry, type Source } from './api';
 
 type Notebook={id:string;title:string;owner:string};
 type Document={id:string;name:string;status:string;error:string|null};
@@ -43,7 +43,7 @@ export default function App() {
   const ready=documents.some(d=>d.status==='ready');
   const abortAll=()=>{controllers.current.forEach(c=>c.abort());controllers.current.clear();};
 
-  useEffect(()=>{fetch('/api/health').then(r=>r.json()).then(h=>setDemo(h.demo_mode)).catch(()=>setError('Start the API to connect your notebook.'));},[]);
+  useEffect(()=>{request<{demo_mode:boolean}>('/health','').then(h=>setDemo(h.demo_mode)).catch(()=>setError('Start the API to connect your notebook.'));},[]);
   useEffect(()=>{
     if(!token) return;
     request<Notebook[]>('/notebooks',token).then(n=>{setNotebooks(n);setActive(n[0]||null);}).catch(e=>setError(e.message));
@@ -60,7 +60,14 @@ export default function App() {
       while(!controller.signal.aborted){
         try {await stream(`/notebooks/${active.id}/events?after=${after}`,token,{signal:controller.signal},e=>{
           after=Number(e.id||after);refresh().catch(()=>{});
-        });} catch(e) {if(controller.signal.aborted)return;setError((e as Error).message);return;}
+        });} catch(e) {
+          if(controller.signal.aborted)return;
+          if(e instanceof TypeError||(e instanceof ApiError&&isGatewayError(e.status))){
+            await waitForRetry(5000,controller.signal).catch(()=>{});
+            continue;
+          }
+          setError((e as Error).message);return;
+        }
       }
     };
     void listen();
@@ -81,6 +88,7 @@ export default function App() {
     const notebook=active;
     setError('');
     for(const file of Array.from(files)){
+      if(file.size>20*1024*1024){setError(`${file.name}: maximum file size is 20 MB.`);continue;}
       const body=new FormData();body.append('file',file);
       const controller=new AbortController();controllers.current.add(controller);
       try{const d=await request<Document>(`/notebooks/${notebook.id}/documents`,token,{method:'POST',body,signal:controller.signal});

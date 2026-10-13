@@ -4,7 +4,7 @@ The user's material is the evidence base. The application should make it easy to
 
 ## Upload path
 
-1. FastAPI verifies the session and notebook owner, writes the uploaded bytes, and atomically records the document and an outbox entry in SQLite.
+1. FastAPI verifies the session and notebook owner, writes the uploaded bytes, and atomically records the document and an outbox entry in one SQLAlchemy transaction over SQLite.
 2. The ingestion worker publishes pending outbox entries to `document.uploaded`. It marks each entry sent only after Kafka acknowledges it.
 3. The consumer extracts pages, captions visual material in live mode, splits the content, embeds it, and transactionally replaces that document's chunks.
 4. Duplicate delivery of a ready document is a no-op. Failed documents are retried up to three times. An exhausted job is published to `document.failed` before its offset is committed. The UI shows document errors and supports manual retry.
@@ -14,7 +14,7 @@ The broker uses one local KRaft node. API and worker share a data volume; Kafka 
 
 ## Chat path
 
-The server captures notebook and account identity before graph execution. The planner resolves conversational references and splits a question into up to three search queries. Every search authorizes the notebook and restricts SQL candidates by owner before vector comparison.
+The server captures notebook and account identity before graph execution. The planner resolves conversational references and splits a question into up to three search queries. Every search authorizes the notebook and restricts ORM query candidates by owner before vector comparison.
 
 The evidence grader decides whether another fact is needed. A follow-up search uses the current evidence to formulate the next query. The graph repeats for at most three passes and keeps at most twelve evidence chunks, then generates a cited answer. Its stream exposes useful progress, evidence and answer tokens; it does not expose a private chain of thought.
 
@@ -39,3 +39,9 @@ LangSmith connects traces across model calls, graph nodes and tools. It is opt-i
 After trying the first version, refine the learning experience around real material. The next iteration should add persistent conversation history and interview feedback, move studio requests to background jobs with progress events, and support document deletion with index cleanup. Then add OIDC, explicit notebook membership and revocation tests, database-backed job leases, a filtered vector index, and a larger human-reviewed evaluation dataset.
 
 Each addition should solve an observed need. The initial architecture keeps each requested technique visible without turning every user action into a complex agent run.
+
+## Persistence
+
+`backend/app/db_models.py` maps notebooks, documents, chunks, outbox entries, ingestion events and artifacts. `backend/app/store.py` owns the SQLAlchemy engine and short-lived sessions, committing each successful unit of work and rolling it back on failure. Model calls, Kafka acknowledgements and SSE waits happen outside database transactions.
+
+The table names and column layout match the original SQLite database. SQLAlchemy JSON mappings read the existing text-encoded vectors and event payloads directly, so this transition preserves document IDs, embeddings and event cursors without rewriting stored data. Foreign-key constraints are declared for newly created tables; existing tables retain their original constraints. SQLite connection PRAGMAs remain driver-level configuration.

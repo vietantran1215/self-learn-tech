@@ -1,46 +1,68 @@
-import json
-import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from functools import lru_cache
+from pathlib import Path
 from fastapi import HTTPException
+from sqlalchemy import create_engine, event as engine_event, select
+from sqlalchemy.engine import Engine, URL
+from sqlalchemy.orm import Session
 from .config import settings
+from .db_models import Base, IngestionEvent, NotebookRecord
+
+
+@lru_cache(maxsize=16)
+def _engine(path: str) -> Engine:
+    engine = create_engine(
+        URL.create('sqlite+pysqlite', database=path),
+        connect_args={'timeout': 30, 'check_same_thread': False},
+    )
+
+    @engine_event.listens_for(engine, 'connect')
+    def configure_sqlite(connection, _):
+        # Driver SQL is limited to SQLite connection settings, not application queries.
+        cursor = connection.cursor()
+        cursor.execute('PRAGMA journal_mode=WAL')
+        cursor.execute('PRAGMA foreign_keys=ON')
+        cursor.close()
+
+    return engine
+
+
+def get_engine() -> Engine:
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    return _engine(str((settings.data_dir / 'app.db').resolve()))
+
 
 @contextmanager
 def db():
-    con = sqlite3.connect(settings.data_dir / "app.db", timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    try:
-        yield con
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
+    """One short-lived ORM session/transaction; rollback automatically on failure.
+
+    Do not retain a session across model calls, Kafka acknowledgements or SSE waits.
+    Loaded fields remain usable after commit/close; no lazy relationships are exposed.
+    """
+    with Session(get_engine(), expire_on_commit=False) as session:
+        with session.begin():
+            yield session
+
 
 def init():
-    with db() as c:
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS notebooks(id TEXT PRIMARY KEY, title TEXT, owner TEXT);
-        CREATE TABLE IF NOT EXISTS documents(id TEXT PRIMARY KEY, notebook TEXT, name TEXT, path TEXT, status TEXT, error TEXT);
-        CREATE TABLE IF NOT EXISTS chunks(id TEXT PRIMARY KEY, document TEXT, page INTEGER, text TEXT, modality TEXT, vector TEXT);
-        CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, document TEXT, sent INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, notebook TEXT, kind TEXT, data TEXT, created REAL);
-        CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY, notebook TEXT, path TEXT, name TEXT);
-        ''')
+    Base.metadata.create_all(get_engine())
+
 
 def uid():
     return str(uuid.uuid4())
 
+
 def authorize(notebook: str, user: str):
-    with db() as c:
-        row = c.execute("SELECT * FROM notebooks WHERE id=? AND owner=?", (notebook, user)).fetchone()
-    if not row:
-        raise HTTPException(404, "Notebook not found")
-    return dict(row)
+    with db() as session:
+        record = session.scalar(select(NotebookRecord).where(
+            NotebookRecord.id == notebook, NotebookRecord.owner == user))
+        if record is None:
+            raise HTTPException(404, 'Notebook not found')
+        return {'id': record.id, 'title': record.title, 'owner': record.owner}
+
 
 def event(notebook, kind, data):
-    with db() as c:
-        c.execute("INSERT INTO events(notebook,kind,data,created) VALUES(?,?,?,?)", (notebook, kind, json.dumps(data), time.time()))
+    with db() as session:
+        session.add(IngestionEvent(notebook=notebook, kind=kind, data=data, created=time.time()))

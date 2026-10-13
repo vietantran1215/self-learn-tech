@@ -1,5 +1,7 @@
 import json
 from typing import TypedDict
+from sqlalchemy import select
+from .db_models import ChunkRecord, DocumentRecord, NotebookRecord
 from langgraph.graph import StateGraph, START, END
 from langgraph.config import get_stream_writer
 from langsmith import traceable
@@ -24,17 +26,18 @@ async def retrieve(notebook, user, query, limit=6):
     vector=(await embed([query]))[0]
     # ACL is part of the candidate query, before vector scoring. No global search/post-filter.
     with db() as c:
-        rows=c.execute('''SELECT c.*,d.name FROM chunks c
-          JOIN documents d ON d.id=c.document JOIN notebooks n ON n.id=d.notebook
-          WHERE n.id=? AND n.owner=? AND d.status='ready' ''',(notebook,user)).fetchall()
+        rows=c.execute(select(ChunkRecord,DocumentRecord.name)
+            .join(DocumentRecord,DocumentRecord.id==ChunkRecord.document)
+            .join(NotebookRecord,NotebookRecord.id==DocumentRecord.notebook)
+            .where(NotebookRecord.id==notebook,NotebookRecord.owner==user,DocumentRecord.status=='ready')).all()
     scored=[]
-    for row in rows:
-        v=json.loads(row["vector"])
+    for row,name in rows:
+        v=row.vector
         if len(v)!=len(vector):
             raise ValueError("Embedding configuration changed; re-upload documents in a fresh data directory")
         norm=(sum(x*x for x in v)*sum(x*x for x in vector))**0.5 or 1
         score=sum(a*b for a,b in zip(v,vector))/norm
-        scored.append({"id":row["id"],"document":row["document"],"name":row["name"],"page":row["page"],"text":row["text"],"modality":row["modality"],"score":score})
+        scored.append({"id":row.id,"document":row.document,"name":name,"page":row.page,"text":row.text,"modality":row.modality,"score":score})
     return sorted(scored,key=lambda x:x["score"],reverse=True)[:limit]
 
 def context(hits):

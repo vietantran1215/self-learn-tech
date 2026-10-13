@@ -8,6 +8,8 @@ from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select, update, column
+from .db_models import NotebookRecord, DocumentRecord, OutboxRecord, IngestionEvent, ArtifactRecord
 from .auth import user, issue
 from .config import settings
 from .store import init, db, authorize, uid
@@ -52,20 +54,22 @@ def login(body: Login):
 @app.get('/api/notebooks')
 def notebooks(identity=Depends(user)):
     with db() as c:
-        return [dict(r) for r in c.execute('SELECT * FROM notebooks WHERE owner=? ORDER BY rowid DESC',(identity,))]
+        return [{'id':r.id,'title':r.title,'owner':r.owner} for r in c.scalars(
+            select(NotebookRecord).where(NotebookRecord.owner==identity).order_by(column('rowid').desc()))]
 
 @app.post('/api/notebooks',status_code=201)
 def create(body: Notebook,identity=Depends(user)):
     id=uid()
     with db() as c:
-        c.execute('INSERT INTO notebooks VALUES(?,?,?)',(id,body.title,identity))
+        c.add(NotebookRecord(id=id,title=body.title,owner=identity))
     return {'id':id,'title':body.title,'owner':identity}
 
 @app.get('/api/notebooks/{notebook}/documents')
 def documents(notebook: str,identity=Depends(user)):
     authorize(notebook,identity)
     with db() as c:
-        return [dict(r) for r in c.execute('SELECT id,name,status,error FROM documents WHERE notebook=?',(notebook,))]
+        return [{'id':r.id,'name':r.name,'status':r.status,'error':r.error} for r in c.scalars(
+            select(DocumentRecord).where(DocumentRecord.notebook==notebook))]
 
 @app.post('/api/notebooks/{notebook}/documents',status_code=202)
 async def upload(notebook: str,file: UploadFile,identity=Depends(user)):
@@ -87,8 +91,9 @@ async def upload(notebook: str,file: UploadFile,identity=Depends(user)):
         if size==0:
             raise HTTPException(400,'Empty file')
         with db() as c:
-            c.execute('INSERT INTO documents VALUES(?,?,?,?,?,?)',(id,notebook,name,str(path),'queued',None))
-            c.execute('INSERT INTO outbox(id,document) VALUES(?,?)',(uid(),id))
+            c.add(DocumentRecord(id=id,notebook=notebook,name=name,path=str(path),status='queued',error=None))
+            c.flush()
+            c.add(OutboxRecord(id=uid(),document=id))
     except Exception:
         path.unlink(missing_ok=True)
         raise
@@ -100,13 +105,15 @@ async def upload(notebook: str,file: UploadFile,identity=Depends(user)):
 def retry(notebook: str,document: str,identity=Depends(user)):
     authorize(notebook,identity)
     with db() as c:
-        row=c.execute("SELECT status FROM documents WHERE id=? AND notebook=?",(document,notebook)).fetchone()
+        row=c.scalar(select(DocumentRecord).where(DocumentRecord.id==document,DocumentRecord.notebook==notebook))
         if not row:
             raise HTTPException(404,'Document not found')
-        if row['status']!='failed':
+        if row.status!='failed':
             raise HTTPException(409,'Only failed uploads can be retried')
-        c.execute("UPDATE documents SET status='queued',error=NULL WHERE id=?",(document,))
-        c.execute('INSERT INTO outbox(id,document) VALUES(?,?)',(uid(),document))
+        changed=c.execute(update(DocumentRecord).where(DocumentRecord.id==document,DocumentRecord.status=='failed').values(status='queued',error=None))
+        if changed.rowcount!=1:
+            raise HTTPException(409,'Only failed uploads can be retried')
+        c.add(OutboxRecord(id=uid(),document=document))
     return {'status':'queued'}
 
 @app.get('/api/notebooks/{notebook}/events')
@@ -118,10 +125,10 @@ async def events(notebook: str,after: int=0,identity=Depends(user)):
         for _ in range(25):
             authorize(notebook,identity)
             with db() as c:
-                rows=c.execute('SELECT * FROM events WHERE notebook=? AND id>? ORDER BY id',(notebook,cursor)).fetchall()
+                rows=list(c.scalars(select(IngestionEvent).where(IngestionEvent.notebook==notebook,IngestionEvent.id>cursor).order_by(IngestionEvent.id)))
             for row in rows:
-                cursor=row['id']
-                yield sse({'type':'ingestion','id':cursor,**json.loads(row['data'])})
+                cursor=row.id
+                yield sse({'type':'ingestion','id':cursor,**row.data})
             yield ': heartbeat\n\n'
             await asyncio.sleep(1)
     return StreamingResponse(stream(),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
@@ -161,8 +168,8 @@ async def deck(notebook: str,body: Studio,identity=Depends(user)):
 @app.get('/api/artifacts/{artifact}')
 def download(artifact: str,identity=Depends(user)):
     with db() as c:
-        row=c.execute('SELECT * FROM artifacts WHERE id=?',(artifact,)).fetchone()
+        row=c.get(ArtifactRecord,artifact)
     if not row:
         raise HTTPException(404,'Artifact not found')
-    authorize(row['notebook'],identity)
-    return FileResponse(row['path'],filename=row['name'],media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
+    authorize(row.notebook,identity)
+    return FileResponse(row.path,filename=row.name,media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')

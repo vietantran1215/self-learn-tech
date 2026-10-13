@@ -10,6 +10,7 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
+from .db_models import ArtifactRecord
 from .config import settings
 from .models import llm, content_text
 from .rag import retrieve, context
@@ -117,5 +118,5 @@ def export_deck(deck: Deck,hits,notebook):
     path=settings.data_dir / f'{artifact}.pptx'
     prs.save(path)
     with db() as c:
-        c.execute('INSERT INTO artifacts VALUES(?,?,?,?)',(artifact,notebook,str(path),'study-deck.pptx'))
+        c.add(ArtifactRecord(id=artifact,notebook=notebook,path=str(path),name='study-deck.pptx'))
     return artifact

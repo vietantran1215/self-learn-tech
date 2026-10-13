@@ -13,7 +13,7 @@ python3 scripts/setup_env.py
 docker compose up --build
 ```
 
-Open **http://localhost:5173**. Sign in as **Alice** or **Bob**, using `learn-local` unless you changed `DEMO_PASSWORD`. Create a notebook, upload `evaluation/source.md`, wait for **ready**, then try chat, interview practice, or study slides. The API documentation is at http://localhost:8000/docs.
+Open **http://localhost:5173**. Sign in as **Alice** or **Bob**, using `learn-local` unless you changed `DEMO_PASSWORD`. Create a notebook, upload `evaluation/source.md`, wait for **ready**, then try chat, interview practice, or study slides. The API documentation is at http://localhost:8000/docs. Nginx resolves the API through Docker DNS at runtime, so recreating the API does not require restarting the frontend.
 
 Uploads return immediately with HTTP 202. A separate worker dispatches the durable outbox to local Kafka and processes the document asynchronously. Queued documents need a running worker and broker; the API does not perform ingestion inline.
 
@@ -60,9 +60,17 @@ CHAT_MODEL=gpt-4.1-mini
 EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-The provider must implement OpenAI-compatible chat, tool calls and embeddings. Image ingestion additionally needs a vision-capable chat model. Model names are configurable examples; choose models available from your provider. For Docker, apply changed environment values with `docker compose up -d --force-recreate api worker`.
+The provider must implement OpenAI-compatible chat, tool calls and embeddings. Image ingestion additionally needs a vision-capable chat model. Leave `CHAT_TEMPERATURE` unset to use the provider default; some reasoning models reject a forced temperature of zero. Model names are configurable examples; choose models available from your provider. For Docker, apply changed environment values with `docker compose up -d --force-recreate api worker`.
 
-Create a fresh notebook and re-upload sources after changing modes or embedding models. Existing chunks retain their old vectors and visual extraction; this version does not migrate indexes. Different vector dimensions are rejected. Same-dimension models cannot be automatically distinguished yet.
+When switching from demo to live mode, retained source chunks can be migrated without uploading again:
+
+```sh
+docker compose stop worker
+docker compose exec -e DEMO_MODE=false -T api python - < scripts/reindex_embeddings.py
+docker compose up -d --force-recreate api worker
+```
+
+The migration updates all ready chunks transactionally after embedding batches succeed. It retains extracted text and existing visual captions; it does not add vision captions to PDFs previously processed in demo mode. Re-upload into a fresh notebook for full live vision extraction, or after other extraction changes. Without this migration, existing chunks retain their previous vectors and visual extraction. Different vector dimensions are rejected. Same-dimension models cannot be automatically distinguished yet.
 
 Demo mode uses deterministic hashed term vectors and returns labelled excerpts. Quizzes and decks in demo mode use excerpts as examples; they are not intelligent model-generated content. Image-only uploads fail with an actionable error in demo mode. Scanned PDFs require live vision mode. Chat transcripts stay in browser memory for the current page session; notebooks, documents, events and generated files persist on the backend.
 
@@ -70,7 +78,7 @@ Demo mode uses deterministic hashed term vectors and returns labelled excerpts. 
 
 | Technique | Implementation |
 | --- | --- |
-| Permission-aware RAG | Signed sessions identify the account; notebook ownership is checked on API reads/writes, retrieval, events and downloads. Retrieval candidates are constrained by owner and notebook in SQL **before** similarity scoring. Agent search tools close over that scope. |
+| Permission-aware RAG | Signed sessions identify the account; notebook ownership is checked on API reads/writes, retrieval, events and downloads. SQLAlchemy retrieval queries constrain candidates by owner and notebook **before** similarity scoring. Agent search tools close over that scope. |
 | Multimodal RAG | PDF text plus rendered visual pages, PPTX text plus embedded images, and PNG/JPEG descriptions retain document/page/modality metadata. Vision descriptions and text use the same text embedding index. |
 | Adaptive RAG | LangGraph's `plan → search → assess` loop branches on model-assessed evidence sufficiency. |
 | Multi-hop reasoning | Initial query decomposition and evidence-driven follow-up queries gather bridge facts; at most three search passes and twelve final chunks. Final generation cites combined evidence and is instructed to acknowledge gaps. |
@@ -110,6 +118,7 @@ docker compose exec -w /app api python evaluation/run.py --notebook NOTEBOOK_ID
 ```sh
 .venv/bin/pytest backend/tests -q
 npm run build --prefix frontend
+npm run test --prefix frontend
 .venv/bin/pip check
 .venv/bin/python evaluation/run.py --validate-only
 ```
@@ -119,10 +128,12 @@ Tests cover account isolation across retrieval, upload, chat, events, studio and
 ## First-version boundaries
 
 - Authentication uses two local development accounts and a shared configured password. Replace it with verified OIDC identities, per-user sessions and rate limits before a hosted release. The notebook boundary currently supports private ownership, not collaboration or role-based sharing.
-- SQLite WAL and local files keep setup understandable. Retrieval scores all authorized chunks in memory; use PostgreSQL/pgvector or a filtered vector service when the corpus grows. Run a single ingestion worker against this shared local database.
+- SQLAlchemy ORM sessions manage persistence over SQLite WAL; local files keep setup understandable. Retrieval scores all authorized chunks in memory; use PostgreSQL/pgvector or a filtered vector service when the corpus grows. Run a single ingestion worker against this shared local database.
 - Multimodal retrieval uses vision-to-text descriptions, not joint image/text embeddings. Audio, video, PPTX chart objects and arbitrary formats are outside this phase. Vision transcription and citations need human review.
 - Chat generation streams tokens. Quiz and deck creation show a busy state and return complete validated results; they are synchronous HTTP requests in this phase.
-- Upload size is capped at 20 MB and PDFs at 100 pages. This is not a hardened untrusted-document processing sandbox. Source instructions are treated as data in prompts, but prompt-injection resistance is not guaranteed.
+- Upload size is capped at 20 MB and PDFs at 2,000 pages by default (`MAX_PDF_PAGES` in `.env`). This is not a hardened untrusted-document processing sandbox. Source instructions are treated as data in prompts, but prompt-injection resistance is not guaranteed.
 - Live model calls, LangSmith trace delivery and paid RAGAS scoring need configured credentials. No scores or production-readiness claims are implied by demo-mode checks.
 
 The framework APIs were checked against the official [LangGraph streaming documentation](https://docs.langchain.com/oss/python/langgraph/streaming), [Deep Agents quickstart](https://docs.langchain.com/oss/python/deepagents/quickstart), and [RAGAS metrics](https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/).
+
+The Compose frontend waits for the API healthcheck during startup. The browser retries up to three times after an initial 502/503/504 response, before a chat stream begins. Accepted chat streams and other POST operations are not replayed. Document-event streams reconnect after temporary gateway/network failures with their last received cursor.

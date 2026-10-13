@@ -1,7 +1,8 @@
 import base64
-import json
 from langsmith import traceable
 from pathlib import Path
+from sqlalchemy import delete
+from .db_models import DocumentRecord, ChunkRecord
 import pymupdf as fitz
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pptx import Presentation
@@ -36,8 +37,8 @@ async def extract(path: Path):
     if suffix == ".pdf":
         pages=[]
         with fitz.open(path) as doc:
-            if len(doc)>100:
-                raise ValueError("Maximum 100 PDF pages")
+            if len(doc)>settings.max_pdf_pages:
+                raise ValueError(f"This PDF has {len(doc)} pages; the configured limit is {settings.max_pdf_pages}.")
             for i,page in enumerate(doc,1):
                 text=page.get_text()
                 if text.strip():
@@ -51,25 +52,33 @@ async def extract(path: Path):
 @traceable(name="document-ingestion")
 async def ingest(document):
     with db() as c:
-        row=c.execute("SELECT * FROM documents WHERE id=?",(document,)).fetchone()
-        if not row or row["status"]=="ready":
+        row=c.get(DocumentRecord,document)
+        if not row or row.status=="ready":
             return
-        c.execute("UPDATE documents SET status='processing',error=NULL WHERE id=?",(document,))
-    event(row["notebook"],"ingestion",{"document":document,"status":"processing"})
+        row.status='processing'
+        row.error=None
+    event(row.notebook,"ingestion",{"document":document,"status":"processing"})
     try:
-        pages=await extract(Path(row["path"]))
+        pages=await extract(Path(row.path))
         splitter=RecursiveCharacterTextSplitter(chunk_size=1200,chunk_overlap=200)
         chunks=[(page,text,modality) for page,body,modality in pages for text in splitter.split_text(body) if text.strip()]
         if not chunks:
             raise ValueError("No readable content. Scanned PDFs require live vision mode.")
-        vectors=await embed([text for _,text,_ in chunks])
+        vectors=[]
+        # Bound embedding request size for book-length documents.
+        for start in range(0,len(chunks),64):
+            vectors.extend(await embed([text for _,text,_ in chunks[start:start+64]]))
         with db() as c:
-            c.execute("DELETE FROM chunks WHERE document=?",(document,))
-            c.executemany("INSERT INTO chunks VALUES(?,?,?,?,?,?)",[(uid(),document,p,t,m,json.dumps(v)) for (p,t,m),v in zip(chunks,vectors)])
-            c.execute("UPDATE documents SET status='ready' WHERE id=?",(document,))
-        event(row["notebook"],"ingestion",{"document":document,"status":"ready","chunks":len(chunks)})
+            if len(vectors)!=len(chunks):
+                raise ValueError('Embedding endpoint returned an incomplete batch')
+            c.execute(delete(ChunkRecord).where(ChunkRecord.document==document))
+            c.add_all([ChunkRecord(id=uid(),document=document,page=p,text=t,modality=m,vector=v) for (p,t,m),v in zip(chunks,vectors)])
+            c.get(DocumentRecord,document).status='ready'
+        event(row.notebook,"ingestion",{"document":document,"status":"ready","chunks":len(chunks)})
     except Exception as exc:
         with db() as c:
-            c.execute("UPDATE documents SET status='failed',error=? WHERE id=?",(str(exc)[:500],document))
-        event(row["notebook"],"ingestion",{"document":document,"status":"failed"})
+            failed=c.get(DocumentRecord,document)
+            failed.status='failed'
+            failed.error=str(exc)[:500]
+        event(row.notebook,"ingestion",{"document":document,"status":"failed"})
         raise

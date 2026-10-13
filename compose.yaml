@@ -27,6 +27,12 @@ services:
       KAFKA_BOOTSTRAP: kafka:29092
     volumes: ["app-data:/data"]
     ports: ["127.0.0.1:8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "__import__('urllib.request', fromlist=['urlopen']).urlopen('http://127.0.0.1:8000/api/health', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
   worker:
     build:
       context: .
@@ -42,7 +48,9 @@ services:
   frontend:
     build: ./frontend
     ports: ["127.0.0.1:5173:80"]
-    depends_on: [api]
+    depends_on:
+      api:
+        condition: service_healthy
 volumes:
   app-data:
   kafka-data:

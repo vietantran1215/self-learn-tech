@@ -2,6 +2,8 @@ import asyncio
 import io
 import json
 import pytest
+from sqlalchemy import select, func
+from app.db_models import ChunkRecord, DocumentRecord, OutboxRecord
 from fastapi.testclient import TestClient
 from pptx import Presentation
 from app.config import settings
@@ -33,12 +35,12 @@ async def test_upload_ingestion_chat_and_artifacts(client):
     nid=notebook(client)
     doc=uploaded(client,nid)
     with db() as c:
-        assert c.execute('SELECT sent FROM outbox').fetchone()['sent']==0
-        assert c.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]==0
+        assert c.scalar(select(OutboxRecord.sent))==0
+        assert c.scalar(select(func.count()).select_from(ChunkRecord))==0
     await ingest(doc)
     await ingest(doc) # Redelivery is idempotent.
     with db() as c:
-        assert c.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]==1
+        assert c.scalar(select(func.count()).select_from(ChunkRecord))==1
     result=client.post(f'/api/notebooks/{nid}/chat',headers=headers(),json={'question':'How does Kafka work?'})
     frames=[json.loads(l[6:]) for l in result.text.splitlines() if l.startswith('data: ')]
     assert frames[-1]['type']=='done'
@@ -79,7 +81,7 @@ async def test_failed_ingestion_retry_and_validation(client):
     assert client.post(f'/api/notebooks/{nid}/documents',headers=headers(),files={'file':('empty.md',b'')}).status_code==400
     doc=uploaded(client,nid,'\x00\xff')
     with db() as c:
-        path=c.execute('SELECT path FROM documents WHERE id=?',(doc,)).fetchone()['path']
+        path=c.get(DocumentRecord,doc).path
     from pathlib import Path
     Path(path).write_bytes(b'\xff')
     with pytest.raises(UnicodeDecodeError):await ingest(doc)
@@ -151,9 +153,9 @@ async def test_image_description_retains_modality_and_page(client,monkeypatch):
     monkeypatch.setattr(ingestion,'embed',embedding)
     await ingest(doc)
     with db() as c:
-        row=c.execute('SELECT * FROM chunks WHERE document=?',(doc,)).fetchone()
-        assert row['modality']=='image' and row['page']==1
-        assert 'producer' in row['text']
+        row=c.scalar(select(ChunkRecord).where(ChunkRecord.document==doc))
+        assert row.modality=='image' and row.page==1
+        assert 'producer' in row.text
 
 async def test_worker_failure_is_durable_before_commit(client,monkeypatch):
     from app import worker
@@ -178,3 +180,20 @@ async def test_worker_failure_is_durable_before_commit(client,monkeypatch):
     assert len(calls)==3
     assert producer.messages==[('document.failed',{'document':'bad'})]
     assert consumer.commits==1
+
+async def test_pdf_over_100_pages_and_configurable_limit(client,monkeypatch):
+    import pymupdf
+    from app.ingestion import extract
+    path=settings.data_dir/'book.pdf'
+    with pymupdf.open() as pdf:
+        for i in range(101):
+            page=pdf.new_page()
+            page.insert_text((72,72),f'Learning material on page {i+1}')
+        pdf.save(path)
+    monkeypatch.setattr(settings,'max_pdf_pages',2000)
+    pages=await extract(path)
+    assert len(pages)==101 and pages[-1][0]==101
+    assert 'page 101' in pages[-1][1]
+    monkeypatch.setattr(settings,'max_pdf_pages',100)
+    with pytest.raises(ValueError,match='101 pages; the configured limit is 100'):
+        await extract(path)

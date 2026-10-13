@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -10,7 +11,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     chat_model: str = "gpt-4.1-mini"
+    chat_temperature: float | None = Field(default=None, ge=0, le=2)
     embedding_model: str = "text-embedding-3-small"
+    max_pdf_pages: int = Field(default=2000, ge=1)
     kafka_bootstrap: str = "localhost:9092"
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""

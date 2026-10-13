@@ -7,7 +7,7 @@ from .config import settings
 def llm():
     if not settings.openai_api_key:
         raise RuntimeError("Configure OPENAI_API_KEY or enable DEMO_MODE")
-    return ChatOpenAI(model=settings.chat_model, api_key=settings.openai_api_key, base_url=settings.openai_base_url, temperature=0)
+    return ChatOpenAI(model=settings.chat_model, api_key=settings.openai_api_key, base_url=settings.openai_base_url, temperature=settings.chat_temperature, timeout=60)
 
 def demo_vector(text):
     v = [0.0]*256

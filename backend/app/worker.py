@@ -2,6 +2,8 @@
 import asyncio
 import json
 import logging
+from sqlalchemy import select, update
+from .db_models import OutboxRecord
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from .config import settings
 from .store import init, db
@@ -13,11 +15,11 @@ log=logging.getLogger(__name__)
 async def dispatch(producer):
     while True:
         with db() as c:
-            rows=c.execute('SELECT * FROM outbox WHERE sent=0 LIMIT 20').fetchall()
+            rows=list(c.scalars(select(OutboxRecord).where(OutboxRecord.sent==0).limit(20)))
         for row in rows:
-            await producer.send_and_wait('document.uploaded',json.dumps({'document':row['document']}).encode(),key=row['document'].encode())
+            await producer.send_and_wait('document.uploaded',json.dumps({'document':row.document}).encode(),key=row.document.encode())
             with db() as c:
-                c.execute('UPDATE outbox SET sent=1 WHERE id=?',(row['id'],))
+                c.execute(update(OutboxRecord).where(OutboxRecord.id==row.id).values(sent=1))
         await asyncio.sleep(1)
 
 async def consume(consumer,producer):
